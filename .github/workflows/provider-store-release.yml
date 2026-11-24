@@ -252,9 +252,8 @@ jobs:
                 "https://cdn.jsdelivr.net/gh/Andrea-lyz/ColorOS-Live-Lyrics-Providers@store-catalog/catalog/stable.json"; then
               mkdir -p "$RUNNER_TEMP/upstream-notes"
               notes="$RUNNER_TEMP/upstream-notes/$MODULE.md"
-              if jq -r --arg id "$MODULE" \
-                  '[.payload|@base64d|fromjson|.entries[]|select(.providerId==$id)|.releaseNotes//empty]|first//empty' \
-                  "$upstream" > "$notes" 2>/dev/null && [ -s "$notes" ]; then
+              node -e 'const fs=require("fs");const env=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const p=JSON.parse(Buffer.from(env.payload,"base64").toString("utf8"));const hit=p.entries.find(e=>e.providerId===process.argv[2]);if(!hit||!hit.releaseNotes){process.exit(1)}fs.writeFileSync(process.argv[3],hit.releaseNotes)' \
+                "$upstream" "$MODULE" "$notes" 2>/dev/null && [ -s "$notes" ]; then
                 args+=(--notes "$MODULE=$notes")
               fi
             fi
