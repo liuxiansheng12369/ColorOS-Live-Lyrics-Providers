@@ -1,0 +1,224 @@
+name: 上游同步与自动构建
+
+on:
+  push:
+    paths:
+      - '.github/trigger/**'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '上游无更新也强制构建一次'
+        type: boolean
+        default: true
+  schedule:
+    # 每天 19:00（北京时间），错开另一个仓的 18:00
+    - cron: '0 11 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-build-main
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/Andrea-lyz/ColorOS-Live-Lyrics-Providers.git
+  FORCE_BUILD: ${{ github.event_name == 'push' || inputs.force || false }}
+
+jobs:
+  sync-and-build:
+    name: 同步上游并构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置提交身份
+        run: |
+          git config user.name "liuxiansheng autosync"
+          git config user.email "liuxiansheng12369@users.noreply.github.com"
+
+      - name: 同步上游
+        id: sync
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --tags --prune upstream main
+
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          AHEAD=$(git rev-list --count upstream/main..HEAD)
+          echo "上游新提交 $BEHIND 条，本地独有提交 $AHEAD 条"
+
+          if [[ "$BEHIND" -eq 0 && "$FORCE_BUILD" != "true" ]]; then
+            echo "上游无新提交，跳过构建"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$BEHIND" -gt 0 ]]; then
+            git merge --ff-only upstream/main || git merge --no-edit -X ours upstream/main
+            git push origin HEAD:main
+            echo "已同步到 $(git rev-parse --short HEAD)"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: 配置 JDK 21
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 赋予 gradlew 执行权限
+        if: steps.sync.outputs.changed == 'true'
+        run: chmod +x ./gradlew
+
+      - name: 配置 Gradle 缓存
+        if: steps.sync.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+          cache-disabled: false
+
+      - name: 解码签名证书
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${SIGNING_KEY:?缺少 Secret：SIGNING_KEY}"
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$GITHUB_WORKSPACE/release.jks"
+          test -s "$GITHUB_WORKSPACE/release.jks"
+          keytool -list -keystore "$GITHUB_WORKSPACE/release.jks" \
+            -storepass "$KEY_STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1
+
+      - name: 构建 APK
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          RELEASE_STORE_FILE: ${{ github.workspace }}/release.jks
+          RELEASE_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ./gradlew assembleV5MatrixRelease :artwork-provider-am:assembleRelease \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            --build-cache --continue --stacktrace
+
+      - name: 收集 APK
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p collected-apks
+          mapfile -d '' APK_FILES < <(
+            find . -type f -name "*.apk" -path "*/build/outputs/apk/release/*" -print0
+          )
+          if (( ${#APK_FILES[@]} == 0 )); then
+            echo "::error::未生成任何 release APK。"
+            exit 1
+          fi
+          for apk in "${APK_FILES[@]}"; do
+            cp -- "$apk" "collected-apks/$(basename "$apk")"
+          done
+          (
+            cd collected-apks
+            sha256sum *.apk > SHA256SUMS
+          )
+          ls -lh collected-apks/
+
+      - name: 上传制品
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apks
+          path: collected-apks/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 生成发布标记
+        if: steps.sync.outputs.changed == 'true'
+        id: stamp
+        run: |
+          echo "tag=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+          echo "label=$(date -u +'%Y-%m-%d %H:%M')" >> "$GITHUB_OUTPUT"
+
+      - name: 发布
+        if: steps.sync.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.stamp.outputs.tag }}
+          name: Build ${{ steps.stamp.outputs.label }}
+          body: |
+            commit: ${{ github.sha }}
+            type: release
+            sync: Andrea-lyz/ColorOS-Live-Lyrics-Providers
+          prerelease: true
+          files: collected-apks/*.apk
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 准备目录签名密钥
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          CATALOG_KEY: ${{ secrets.CATALOG_KEY }}
+        run: |
+          set -euo pipefail
+          : "${CATALOG_KEY:?缺少 Secret：CATALOG_KEY}"
+          printf '%s' "$CATALOG_KEY" | base64 --decode > "$RUNNER_TEMP/catalog.pem"
+          test -s "$RUNNER_TEMP/catalog.pem"
+
+      - name: 生成商店目录
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git fetch origin store-catalog 2>/dev/null || true
+          REV=1
+          if git rev-parse --verify origin/store-catalog >/dev/null 2>&1; then
+            PREV=$(git show origin/store-catalog:catalog/stable.json 2>/dev/null \
+              | python3 -c "import sys,json,base64;d=json.load(sys.stdin);print(json.loads(base64.b64decode(d['payload']))['catalogRevision'])" \
+              || echo 0)
+            REV=$((PREV + 1))
+          fi
+          python3 .github/scripts/gen_catalog.py \
+            --apk-dir collected-apks \
+            --repo "${{ github.repository }}" \
+            --tag "build-${{ steps.stamp.outputs.tag }}" \
+            --commit "${{ github.sha }}" \
+            --key "$RUNNER_TEMP/catalog.pem" \
+            --key-id cll-catalog-liuxiansheng-2026a \
+            --revision "$REV" \
+            --out "$RUNNER_TEMP/catalog-stable.json"
+
+      - name: 发布商店目录
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/catalog-repo/catalog"
+          cp "$RUNNER_TEMP/catalog-stable.json" "$RUNNER_TEMP/catalog-repo/catalog/stable.json"
+          cd "$RUNNER_TEMP/catalog-repo"
+          git init -q
+          git checkout -q -b store-catalog
+          git config user.name "liuxiansheng autosync"
+          git config user.email "liuxiansheng12369@users.noreply.github.com"
+          git add catalog/stable.json
+          git commit -q -m "catalog: build-${{ steps.stamp.outputs.tag }}"
+          git push -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" store-catalog --force
+
+      - name: 清理
+        if: always()
+        run: |
+          rm -f release.jks || true
+          rm -rf collected-apks || true
+          rm -f "$RUNNER_TEMP/catalog.pem" || true
