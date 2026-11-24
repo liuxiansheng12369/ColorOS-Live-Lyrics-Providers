@@ -242,7 +242,23 @@ jobs:
             args+=(--previous "catalog-worktree/$CATALOG_PATH" --trust release/catalog-trust.json)
           fi
           notes="release/notes/$MODULE/$VERSION_NAME.md"
-          if [ -f "$notes" ]; then args+=(--notes "$MODULE=$notes"); fi
+          if [ -f "$notes" ]; then
+            args+=(--notes "$MODULE=$notes")
+          else
+            # 本仓没有该版本的说明文件时，退回上游官方目录里同 providerId 的原文，
+            # 避免重建目录把条目的更新说明清空。
+            upstream="$RUNNER_TEMP/upstream-catalog.json"
+            if curl -fsSL --proto '=https' --retry 2 --retry-delay 2 -o "$upstream" \
+                "https://cdn.jsdelivr.net/gh/Andrea-lyz/ColorOS-Live-Lyrics-Providers@store-catalog/catalog/stable.json"; then
+              mkdir -p "$RUNNER_TEMP/upstream-notes"
+              notes="$RUNNER_TEMP/upstream-notes/$MODULE.md"
+              if jq -r --arg id "$MODULE" \
+                  '[.payload|@base64d|fromjson|.entries[]|select(.providerId==$id)|.releaseNotes//empty]|first//empty' \
+                  "$upstream" > "$notes" 2>/dev/null && [ -s "$notes" ]; then
+                args+=(--notes "$MODULE=$notes")
+              fi
+            fi
+          fi
           node scripts/catalog/build-catalog-payload.mjs "${args[@]}"
           node scripts/catalog/sign-catalog.mjs --payload "$RUNNER_TEMP/payload.json" --key-id "$KEY_ID" --out "$RUNNER_TEMP/catalog.json"
           node scripts/catalog/verify-catalog.mjs --envelope "$RUNNER_TEMP/catalog.json" --trust release/catalog-trust.json
