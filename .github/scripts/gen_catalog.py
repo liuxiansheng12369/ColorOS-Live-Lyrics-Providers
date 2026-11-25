@@ -47,14 +47,13 @@ def pick_label(out):
     candidates = []
     for key in ("zh-CN", "zh-Hans-CN", "zh", ""):
         suffix = ("-" + key) if key else ""
-        pattern = "application-label" + re.escape(suffix) + r":'((?:\\.[^'])*)'"
+        pattern = "application-label" + re.escape(suffix) + r":'((?:\\.|[^'])*)'"
         match = re.search(pattern, out)
         if match:
-            raw = match.group(1)
-            raw = raw.replace("\\'", "'").replace("\\\\", "\\")
+            raw = match.group(1).replace("\\'", "'").replace("\\\\", "\\")
             candidates.append(raw)
     for raw in candidates:
-        text = re.sub(r"\\s+", " ", raw).strip()
+        text = re.sub(r"\s+", " ", raw).strip()
         if text:
             return text[:40]
     return None
