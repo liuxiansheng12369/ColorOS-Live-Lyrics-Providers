@@ -42,6 +42,24 @@ def find_aapt():
     return None
 
 
+def pick_label(out):
+    """从 aapt badging 里挑展示名：优先中文标签，其次默认标签。"""
+    candidates = []
+    for key in ("zh-CN", "zh-Hans-CN", "zh", ""):
+        suffix = ("-" + key) if key else ""
+        pattern = "application-label" + re.escape(suffix) + r":'((?:\\.[^'])*)'"
+        match = re.search(pattern, out)
+        if match:
+            raw = match.group(1)
+            raw = raw.replace("\\'", "'").replace("\\\\", "\\")
+            candidates.append(raw)
+    for raw in candidates:
+        text = re.sub(r"\\s+", " ", raw).strip()
+        if text:
+            return text[:40]
+    return None
+
+
 def dump_badging(aapt, apk):
     out = subprocess.run(
         [aapt, "dump", "badging", apk],
@@ -56,6 +74,7 @@ def dump_badging(aapt, apk):
         "versionCode": int(package.group(2)),
         "versionName": package.group(3),
         "minSdk": int(min_sdk.group(1)) if min_sdk else 21,
+        "displayName": pick_label(out),
     }
 
 
@@ -138,7 +157,7 @@ def main():
             if info["versionCode"] < 1:
                 print("跳过 versionCode 不合规的模块：%s" % module, file=sys.stderr)
                 continue
-            entries.append({
+            entry = {
                 "providerId": module,
                 "kind": kind_of(module),
                 "applicationId": info["applicationId"],
@@ -155,7 +174,10 @@ def main():
                     "sha256": sha256_file(apk_path),
                     "signerSha256": [apk_signer_sha256(apksigner, apk_path)],
                 },
-            })
+            }
+            if info.get("displayName"):
+                entry["displayName"] = info["displayName"]
+            entries.append(entry)
 
     if not entries:
         raise SystemExit("没有可发布的 APK 条目")
